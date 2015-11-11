@@ -18,6 +18,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.TreeSet;
 
 import javax.jms.Message;
 import javax.jms.MessageConsumer;
@@ -32,13 +33,14 @@ import static org.junit.Assert.assertNotNull;
  * Created by art on 6/4/15.
  */
 public class TestJournalFileCleanup {
+
   private static final Logger log = LoggerFactory.getLogger(TestJournalFileCleanup.class);
 
   private static final int KB = 1024;
   private static File dataDirectory;
   private static File kahaDbDirectory;
 
-  private KahaDBPersistenceAdapter kahaDBPersistenceAdapter;
+  private BrokerService brokerService;
 
   @BeforeClass
   public static void configure() {
@@ -57,26 +59,31 @@ public class TestJournalFileCleanup {
 
     FileUtils.deleteDirectory(dataDirectory);
 
-    BrokerService brokerService;
-
     brokerService = this.setupBrokerService();
 
     brokerService.start();
     brokerService.waitUntilStarted();
 
-//    this.sendMessages(brokerService, "test.queue.00", 1);
     this.sendMessages(brokerService, "test.queue.01", 10);
 
     Thread.sleep(25);
-    this.logJournalFileInfo("HAVE {} log files (#{} ... #{}) after producing 10 messages");
+    this.logJournalFileInfo("HAVE {} log files (#{}) after producing 10 messages");
 
     this.performKahaDBCleanup(brokerService);
     this.logJournalFileInfo(
-        "HAVE {} log files (#{} ... #{}) after producing 10 messages and kahadb cleanup");
+        "HAVE {} log files (#{}) after producing 10 messages and kahadb cleanup");
 
+    this.restartBrokerService();
+
+    this.logJournalFileInfo(
+        "HAVE {} log files (#{}) after broker restart with 10 messages stored");
 
     assertEquals(10, brokerService.getAdminView().getTotalMessageCount());
 
+    // Consume 1, ack, and cleanup the DB
+    this.consumeMessages(brokerService, "test.queue.01", 1, true);
+    assertEquals(9, brokerService.getAdminView().getTotalMessageCount());
+    this.performKahaDBCleanup(brokerService);
 
     // Consume all but acknowledge none; do so more than once.
     int totalUnackCycles = 3;
@@ -85,122 +92,49 @@ public class TestJournalFileCleanup {
       cur++;
 
       this.consumeMessages(brokerService, "test.queue.01", 10, false);
-      assertEquals(10, brokerService.getAdminView().getTotalMessageCount());
-      this.logJournalFileInfo("HAVE {} log files (#{} ... #{}) after producing 10 messages and kahadb cleanup; iter={}", cur);
+      assertEquals(9, brokerService.getAdminView().getTotalMessageCount());
+      this.logJournalFileInfo(
+          "HAVE {} log files (#{}) after un-acked consumption and kahadb cleanup; iter={}",
+          cur);
     }
 
     // Acknowledge them all
     this.consumeMessages(brokerService, "test.queue.01", 10, true);
     assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
-    this.logJournalFileInfo("HAVE {} log files (#{} ... #{}) after consuming 10 messages");
+    this.logJournalFileInfo("HAVE {} log files (#{}) after consuming 10 messages");
 
     this.performKahaDBCleanup(brokerService);
-    this.logJournalFileInfo("HAVE {} log files (#{} ... #{}) after consuming 10 messages and kahaDB cleanup");
+    this.logJournalFileInfo(
+        "HAVE {} log files (#{}) after consuming 10 messages and kahaDB cleanup");
 
     // Produce one more, and consume the last of the initial 50
     this.sendMessages(brokerService, "test.queue.01", 1);
     this.consumeMessages(brokerService, "test.queue.01", 1, true);
     assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
 
-
     this.performKahaDBCleanup(brokerService);
-    this.logJournalFileInfo("FINALLY HAVE {} log files (#{} ... #{})");
-
+    this.logJournalFileInfo("FINALLY HAVE {} log files (#{})");
 
     brokerService.stop();
     brokerService.waitUntilStopped();
-
-
-
-    //
-    // PART 2 - reload the same broker (using a newly-created broker service) and validate the
-    //          counts.
-    //
-
-//    brokerService = this.setupBrokerService();
-//
-//    brokerService.start();
-//    brokerService.waitUntilStarted();
-//
-//    long count = brokerService.getAdminView().getTotalMessageCount();
-//    assertEquals(0, count);
   }
-
-//  @Ignore
-//  @Test(timeout = 60000)
-//  public void testDeleteFileAndRestart() throws Exception {
-//    //
-//    // Start the broker once with an empty directory.
-//    //
-//
-//    FileUtils.deleteDirectory(dataDirectory);
-//
-//    BrokerService brokerService;
-//
-//    brokerService = this.setupBrokerService();
-//
-//    brokerService.start();
-//    brokerService.waitUntilStarted();
-//
-////    this.sendMessages(brokerService, "test.queue.00", 1);
-//    this.sendMessages(brokerService, "test.queue.01", 10);
-//
-//    File Db1File = new File(kahaDbDirectory, "db-1.log");
-//    Db1File.delete();
-//
-//
-//    this.restartBrokerService(brokerService);
-//
-//
-//    assertEquals(10, brokerService.getAdminView().getTotalMessageCount());
-//
-//
-//    // Acknowledge them all
-//    this.consumeMessages(brokerService, "test.queue.01", 10, true);
-//    assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
-//
-//    // Produce one more, and consume the last of the initial 50
-//    this.sendMessages(brokerService, "test.queue.01", 1);
-//    this.consumeMessages(brokerService, "test.queue.01", 1, true);
-//    assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
-//
-//    Thread.sleep(1000);
-//
-//    brokerService.stop();
-//    brokerService.waitUntilStopped();
-//
-//
-//
-//    //
-//    // PART 2 - reload the same broker (using a newly-created broker service) and validate the
-//    //          counts.
-//    //
-//
-////    brokerService = this.setupBrokerService();
-////
-////    brokerService.start();
-////    brokerService.waitUntilStarted();
-////
-////    long count = brokerService.getAdminView().getTotalMessageCount();
-////    assertEquals(0, count);
-//  }
 
   protected void logJournalFileInfo(String pattern, Object... additionalDetails) {
     List<Object> details = new LinkedList<Object>();
 
     File[] journalFiles = this.findJournalFiles(kahaDbDirectory);
-    int[] lowHighFileNums = this.getJournalFileLowHigh(journalFiles);
+    String journaleFileNums = this.getJournalFileNumbers(journalFiles);
+
 
     details.add(journalFiles.length);
-    details.add(lowHighFileNums[0]);
-    details.add(lowHighFileNums[1]);
+    details.add(journaleFileNums);
     details.addAll(Arrays.asList(additionalDetails));
 
     log.info(pattern, details.toArray(new Object[details.size()]));
   }
 
   protected File[] findJournalFiles(File kahaDirectory) {
-    File [] journalFiles = kahaDirectory.listFiles(new FileFilter() {
+    File[] journalFiles = kahaDirectory.listFiles(new FileFilter() {
       public boolean accept(File pathname) {
         return pathname.getName().matches("db-[0-9]+\\.log");
       }
@@ -209,7 +143,7 @@ public class TestJournalFileCleanup {
     return journalFiles;
   }
 
-  protected int[] getJournalFileLowHigh (File[] journalFiles) {
+  protected int[] getJournalFileLowHigh(File[] journalFiles) {
     int[] result = new int[2];
 
     if (journalFiles.length > 0) {
@@ -233,29 +167,91 @@ public class TestJournalFileCleanup {
     return result;
   }
 
+  protected String getJournalFileNumbers(File[] journalFiles) {
+    TreeSet<Integer> numberSet = new TreeSet<>();
+    StringBuilder result = new StringBuilder();
+
+    if (journalFiles.length > 0) {
+      for (File oneFile : journalFiles) {
+        int num = this.extractFileNumber(oneFile);
+        numberSet.add(num);
+      }
+
+      boolean isFirst = true;
+      int numRange = 0;
+      int start = 0;
+      int last = 0;
+
+      for (Integer oneNum : numberSet) {
+        if (isFirst) {
+          start = oneNum;
+          last = oneNum;
+          isFirst = false;
+        } else {
+          if (oneNum == last + 1) {
+            last = oneNum;
+          } else {
+            if (numRange != 0) {
+              result.append(",");
+            }
+
+            result.append(Integer.toString(start));
+
+            if (start != last) {
+              result.append("-");
+              result.append(Integer.toString(last));
+            }
+
+            start = oneNum;
+            last = oneNum;
+            numRange++;
+          }
+        }
+      }
+
+      // Last range
+      if (numRange != 0) {
+        result.append(",");
+      }
+      result.append(Integer.toString(start));
+      if (start != last) {
+        result.append("-");
+        result.append(Integer.toString(last));
+      }
+    } else {
+      result.append("none");
+    }
+
+    return result.toString();
+  }
+
   protected int extractFileNumber(File file) {
     String numPart = file.getName().replace("db-", "").replace(".log", "");
 
     return Integer.parseInt(numPart);
   }
 
-  protected void restartBrokerService (BrokerService brokerService) throws Exception {
+  protected void restartBrokerService() throws Exception {
     log.info("Shutting down broker service with {} messages",
              brokerService.getAdminView().getTotalMessageCount());
 
-    brokerService.stop();
-    brokerService.waitUntilStopped();
-    brokerService.start();
-    brokerService.waitUntilStarted();
+    this.brokerService.stop();
+    this.brokerService.waitUntilStopped();
+
+    //
+    // Prepare a fresh broker service object
+    //
+    this.brokerService = this.setupBrokerService();
+
+    this.brokerService.start();
+    this.brokerService.waitUntilStarted();
 
     log.info("Restarted broker service with {} messages",
-             brokerService.getAdminView().getTotalMessageCount());
+             this.brokerService.getAdminView().getTotalMessageCount());
   }
 
   /**
    * Prepare the broker service for testing.
-   * @return
-   * @throws Exception
    */
   protected BrokerService setupBrokerService() throws Exception {
     BrokerService brokerService = new BrokerService();
@@ -266,10 +262,9 @@ public class TestJournalFileCleanup {
     KahaDBPersistenceAdapter persistenceAdapter = new KahaDBPersistenceAdapter();
     persistenceAdapter.setDirectory(kahaDbDirectory);
     persistenceAdapter.setJournalMaxFileLength(512);
-    persistenceAdapter.setCleanupInterval(999999999L); // try to disable so we control when cleanup happens
+    persistenceAdapter
+        .setCleanupInterval(999999999L); // try to disable so we control when cleanup happens
     brokerService.setPersistenceAdapter(persistenceAdapter);
-
-//    persistenceAdapter.getStore().checkpoint(false);
 
     PolicyMap policies = new PolicyMap();
 
@@ -313,7 +308,8 @@ public class TestJournalFileCleanup {
     }
   }
 
-  protected void consumeMessages(BrokerService brokerService, String queueName, int max, boolean ackNormally)
+  protected void consumeMessages(BrokerService brokerService, String queueName, int max,
+                                 boolean ackNormally)
       throws Exception {
 
     ActiveMQConnection connection = ActiveMQConnection
@@ -327,7 +323,8 @@ public class TestJournalFileCleanup {
       int cur;
       cur = 0;
 
-      log.info("Starting to consume up to {} messages on queue '{}'", max, queueName);
+      log.info("Starting to consume up to {} messages on queue '{}' ackNormally={}", max, queueName,
+               ackNormally);
 
       Message msg = consumer.receive(100);
       while ((cur < max) && (msg != null)) {
