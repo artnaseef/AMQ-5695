@@ -17,7 +17,7 @@
 	</logger>
 
 	<logger name="org.apache.activemq.store.kahadb.KahaDBStore">
-		<level value="trace" />
+		<level value="info" />
 	</logger>
 
 	<root>

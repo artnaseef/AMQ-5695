@@ -19,6 +19,7 @@ import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.jms.Message;
 import javax.jms.MessageConsumer;
@@ -41,6 +42,8 @@ public class TestJournalFileCleanup {
   private static File kahaDbDirectory;
 
   private BrokerService brokerService;
+  private ActiveMQConnection consumerConnection;
+  private ConsumerThread consumerThread;
 
   @BeforeClass
   public static void configure() {
@@ -64,59 +67,15 @@ public class TestJournalFileCleanup {
     brokerService.start();
     brokerService.waitUntilStarted();
 
-    this.sendMessages(brokerService, "test.queue.01", 10);
+    this.startConsumer("test.queue.01");
+    this.sendMessages(brokerService, "test.queue.01", 10000);
 
-    Thread.sleep(25);
-    this.logJournalFileInfo("HAVE {} log files (#{}) after producing 10 messages");
+    Thread.sleep(1000);
+    this.logJournalFileInfo("HAVE {} log files (#{}) after producing messages");
 
     this.performKahaDBCleanup(brokerService);
     this.logJournalFileInfo(
         "HAVE {} log files (#{}) after producing 10 messages and kahadb cleanup");
-
-    this.restartBrokerService();
-
-    this.logJournalFileInfo(
-        "HAVE {} log files (#{}) after broker restart with 10 messages stored");
-
-    assertEquals(10, brokerService.getAdminView().getTotalMessageCount());
-
-    // Consume 1, ack, and cleanup the DB
-    this.consumeMessages(brokerService, "test.queue.01", 1, true);
-    assertEquals(9, brokerService.getAdminView().getTotalMessageCount());
-    this.performKahaDBCleanup(brokerService);
-
-    // Consume all but acknowledge none; do so more than once.
-    int totalUnackCycles = 3;
-    int cur = 0;
-    while (cur < totalUnackCycles) {
-      cur++;
-
-      this.consumeMessages(brokerService, "test.queue.01", 10, false);
-      assertEquals(9, brokerService.getAdminView().getTotalMessageCount());
-      this.logJournalFileInfo(
-          "HAVE {} log files (#{}) after un-acked consumption and kahadb cleanup; iter={}",
-          cur);
-    }
-
-    // Acknowledge them all
-    this.consumeMessages(brokerService, "test.queue.01", 10, true);
-    assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
-    this.logJournalFileInfo("HAVE {} log files (#{}) after consuming 10 messages");
-
-    this.performKahaDBCleanup(brokerService);
-    this.logJournalFileInfo(
-        "HAVE {} log files (#{}) after consuming 10 messages and kahaDB cleanup");
-
-    // Produce one more, and consume the last of the initial 50
-    this.sendMessages(brokerService, "test.queue.01", 1);
-    this.consumeMessages(brokerService, "test.queue.01", 1, true);
-    assertEquals(0, brokerService.getAdminView().getTotalMessageCount());
-
-    this.performKahaDBCleanup(brokerService);
-    this.logJournalFileInfo("FINALLY HAVE {} log files (#{})");
-
-    brokerService.stop();
-    brokerService.waitUntilStopped();
   }
 
   protected void logJournalFileInfo(String pattern, Object... additionalDetails) {
@@ -141,30 +100,6 @@ public class TestJournalFileCleanup {
     });
 
     return journalFiles;
-  }
-
-  protected int[] getJournalFileLowHigh(File[] journalFiles) {
-    int[] result = new int[2];
-
-    if (journalFiles.length > 0) {
-      result[0] = extractFileNumber(journalFiles[0]);
-      result[1] = result[0];
-
-      for (File oneFile : journalFiles) {
-        int num = extractFileNumber(oneFile);
-        if (num < result[0]) {
-          result[0] = num;
-        }
-        if (num > result[1]) {
-          result[1] = num;
-        }
-      }
-    } else {
-      result[0] = -1;
-      result[1] = -1;
-    }
-
-    return result;
   }
 
   protected String getJournalFileNumbers(File[] journalFiles) {
@@ -261,9 +196,11 @@ public class TestJournalFileCleanup {
 
     KahaDBPersistenceAdapter persistenceAdapter = new KahaDBPersistenceAdapter();
     persistenceAdapter.setDirectory(kahaDbDirectory);
-    persistenceAdapter.setJournalMaxFileLength(512);
+//    persistenceAdapter.setJournalMaxFileLength(512);
+    persistenceAdapter.setJournalMaxFileLength(10 * KB);
     persistenceAdapter
         .setCleanupInterval(999999999L); // try to disable so we control when cleanup happens
+    persistenceAdapter.setConcurrentStoreAndDispatchQueues(true);
     brokerService.setPersistenceAdapter(persistenceAdapter);
 
     PolicyMap policies = new PolicyMap();
@@ -339,6 +276,60 @@ public class TestJournalFileCleanup {
       log.info("Finsihed consuming {} messages with max {} on queue '{}'", cur, max, queueName);
     } finally {
       connection.close();
+    }
+  }
+
+  protected void startConsumer(final String queueName) {
+    this.consumerThread = new ConsumerThread(queueName);
+    this.consumerThread.start();
+  }
+
+  protected void stopConsumer() {
+    this.consumerThread.shutdown();
+  }
+
+  protected class ConsumerThread extends Thread {
+    private final String queueName;
+    private AtomicBoolean shutdownInd = new AtomicBoolean(false);
+
+    public ConsumerThread(String queueName) {
+      this.queueName = queueName;
+    }
+
+    public void shutdown() {
+      this.shutdownInd.set(true);
+    }
+
+    @Override
+    public void run() {
+      int numConsumed = 0;
+
+      try {
+        ActiveMQConnection connection = ActiveMQConnection
+            .makeConnection(brokerService.getVmConnectorURI().toString());
+
+        try {
+          connection.start();
+          Session session = connection.createSession(false, Session.CLIENT_ACKNOWLEDGE);
+          MessageConsumer consumer = session.createConsumer(new ActiveMQQueue(queueName));
+
+          log.info("Starting consumer on queue {}", queueName);
+
+          while (! shutdownInd.get()) {
+            Message msg = consumer.receive();
+            msg.acknowledge();
+            numConsumed++;
+          }
+        } finally {
+          connection.close();
+        }
+
+      } catch (Exception exc) {
+        if (!shutdownInd.get()) {
+          log.error("consumer terminated with exception", exc);
+        }
+      }
+      log.info("Consumer read {} messages", numConsumed);
     }
   }
 }
